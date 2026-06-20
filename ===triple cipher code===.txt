@@ -1,0 +1,1430 @@
+/*================================================================
+ *  TRIPLE CIPHER SYSTEM — ESP32 + SSD1306 OLED
+ *  Mode 1: PVRSC   |  Mode 2: Magic Square  |  Mode 3: Fractal Atbash
+ *  Enter 0 in any mode to return to mode selection.
+ *================================================================*/
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <math.h>
+
+/* ============ SHARED OLED & I2C ============ */
+#define I2C_SDA    21
+#define I2C_SCL    22
+#define OLED_RST   -1
+#define OLED_ADR   0x3C
+// Aliases used by individual cipher sections
+#define OLED_W     128
+#define OLED_H     64
+#define OLED_RESET OLED_RST
+#define OLED_ADDR  OLED_ADR
+#define SCR_W      OLED_W
+#define SCR_H      OLED_H
+#define SCREEN_W   OLED_W
+#define SCREEN_H   OLED_H
+#define SDA_PIN    I2C_SDA
+#define SCL_PIN    I2C_SCL
+
+Adafruit_SSD1306 oled(OLED_W, OLED_H, &Wire, OLED_RST);
+bool oledOK = true;
+int  activeMode = 0;          // 0=menu,1=PVRSC,2=MagSq,3=FracAtb
+
+void showMainMenu();          // forward
+
+/*================================================================
+ *              MODE 1 — PVRSC  GLOBALS & FUNCTIONS
+ *================================================================*/
+#define STROKE_LEN      18
+#define CENTER_Y        32
+#define SYMBOL_SPACING  32
+#define MAX_SYMBOLS     40
+#define SCROLL_DELAY    30
+#define CHAR_BUILD_DELAY 100
+#define PAUSE_AT_END    2000
+
+struct PVRSCEncoding { float theta; int stroke_count; int dot_modifier; int sector; };
+struct PVRSCPacket   { float theta; int stroke_count; int dot_modifier; int sector;
+                       char original_char; int position; uint32_t time_seed; };
+struct PVRSCSymbol   { float theta; int stroke_count; int dot_modifier;
+                       char original_char; int position; };
+
+PVRSCSymbol  encodedSymbols[MAX_SYMBOLS];
+PVRSCPacket  encryptedPackets[MAX_SYMBOLS];
+int          totalSymbols = 0;
+uint32_t     session_time_seed = 0;
+uint32_t     received_seed = 0;
+String       currentText = "PVRSC IDEAL";
+String       lastDecrypted = "";
+
+enum PVRSCMode { SYS_ENCRYPT, SYS_DECRYPT, SYS_DIAGNOSTICS };
+PVRSCMode pvrscMode = SYS_ENCRYPT;
+
+// --- encoder ---
+PVRSCEncoding pvrsc_encode(char character, int position, uint32_t time_seed) {
+    PVRSCEncoding r;
+    uint32_t h = ((uint32_t)character) ^ ((uint32_t)(position << 8)) ^ (time_seed << 16);
+    h ^= h >> 16; h *= 0x85ebca6b; h ^= h >> 13; h *= 0xc2b2ae35; h ^= h >> 16;
+    r.theta = (float)(h % 360000) / 1000.0f;
+    r.stroke_count = (h % 20) + 1;
+    r.dot_modifier = ((h >> 5) % 15) + 1;
+    r.sector = (int)(r.theta / 22.5f) + 1;
+    return r;
+}
+
+// --- single-char decrypt ---
+char pvrsc_decrypt_char(float theta, int sc, int dm, int pos, uint32_t seed) {
+    for (int c = 32; c <= 126; c++) {
+        PVRSCEncoding e = pvrsc_encode((char)c, pos, seed);
+        if (fabs(e.theta - theta) < 0.001f && e.stroke_count == sc && e.dot_modifier == dm)
+            return (char)c;
+    }
+    return '\0';
+}
+
+// --- full-string decrypt from packets ---
+String pvrsc_decrypt_string(PVRSCPacket* pk, int cnt) {
+    String res = "";
+    Serial.println(F("\n[DECRYPTION ENGINE] Starting..."));
+    Serial.println(F("Pos | Theta   | Ni | Di | Found"));
+    Serial.println(F("----+---------+----+----+------"));
+    for (int i = 0; i < cnt; i++) {
+        char f = pvrsc_decrypt_char(pk[i].theta, pk[i].stroke_count,
+                                     pk[i].dot_modifier, pk[i].position, pk[i].time_seed);
+        Serial.print(pk[i].position); Serial.print(F(" | "));
+        Serial.print(pk[i].theta, 3); Serial.print(F(" | "));
+        Serial.print(pk[i].stroke_count); Serial.print(F(" | "));
+        Serial.print(pk[i].dot_modifier); Serial.print(F(" | "));
+        if (f) { Serial.println(f); res += f; }
+        else   { Serial.println(F("ERR")); res += '?'; }
+    }
+    Serial.print(F("\n[DECRYPTED]: ")); Serial.println(res);
+    return res;
+}
+
+// --- manual decrypt from serial data ---
+String pvrsc_decrypt_from_serial(String cd, uint32_t seed) {
+    String res = ""; int ci = 0, ps = 0;
+    Serial.println(F("\n[MANUAL DECRYPT] Parsing..."));
+    for (int i = 0; i <= (int)cd.length(); i++) {
+        char ch = (i < (int)cd.length()) ? cd[i] : ';';
+        if (ch == ';') {
+            String seg = cd.substring(ps, i); ps = i + 1;
+            if (seg.length() == 0) continue;
+            float th = 0; int sc = 0, dm = 0, po = ci + 1;
+            int cp[3], cc = 0;
+            for (int j = 0; j < (int)seg.length() && cc < 3; j++)
+                if (seg[j] == ',') cp[cc++] = j;
+            if (cc >= 3) {
+                th = seg.substring(0, cp[0]).toFloat();
+                sc = seg.substring(cp[0]+1, cp[1]).toInt();
+                dm = seg.substring(cp[1]+1, cp[2]).toInt();
+                po = seg.substring(cp[2]+1).toInt();
+            } else if (cc == 2) {
+                th = seg.substring(0, cp[0]).toFloat();
+                sc = seg.substring(cp[0]+1, cp[1]).toInt();
+                dm = seg.substring(cp[1]+1).toInt();
+            }
+            char f = pvrsc_decrypt_char(th, sc, dm, po, seed);
+            res += (f ? f : '?');
+            Serial.print(F("Seg: ")); Serial.print(seg);
+            Serial.print(F(" -> '")); Serial.print(f); Serial.println(F("'"));
+            ci++;
+        }
+    }
+    return res;
+}
+
+// --- draw symbol ---
+void draw_pvrsc_symbol(int cx, int cy, float theta, int ni, int di) {
+    double rad = (double)theta * (M_PI / 180.0);
+    int ex = cx + (int)(STROKE_LEN * cos(rad));
+    int ey = cy - (int)(STROKE_LEN * sin(rad));
+    oled.drawLine(cx, cy, ex, ey, SSD1306_WHITE);
+    oled.fillCircle(cx, cy, 2, SSD1306_WHITE);
+    for (int i = 1; i <= di; i++) {
+        float d = (float)i / (di + 1);
+        oled.drawPixel(cx + (int)(STROKE_LEN*d*cos(rad)),
+                       cy - (int)(STROKE_LEN*d*sin(rad)), SSD1306_WHITE);
+    }
+}
+
+// --- encode & store ---
+void encode_text(String pt) {
+    session_time_seed = millis() / 1000;
+    totalSymbols = 0;
+    for (int i = 0; i < (int)pt.length() && i < MAX_SYMBOLS; i++) {
+        PVRSCEncoding e = pvrsc_encode(pt[i], i+1, session_time_seed);
+        encodedSymbols[totalSymbols]  = { e.theta, e.stroke_count, e.dot_modifier, pt[i], i+1 };
+        encryptedPackets[totalSymbols] = { e.theta, e.stroke_count, e.dot_modifier, e.sector,
+                                           pt[i], i+1, session_time_seed };
+        totalSymbols++;
+    }
+    Serial.println(F("\n[ENCRYPTED] pos|theta|Ni|Di"));
+    Serial.print(F("SEED=")); Serial.println(session_time_seed);
+    for (int i = 0; i < totalSymbols; i++) {
+        Serial.print(encryptedPackets[i].position); Serial.print('|');
+        Serial.print(encryptedPackets[i].theta, 3); Serial.print('|');
+        Serial.print(encryptedPackets[i].stroke_count); Serial.print('|');
+        Serial.println(encryptedPackets[i].dot_modifier);
+    }
+    Serial.println(F("--- END CIPHER ---"));
+}
+
+// --- scroll symbols on OLED ---
+void display_continuous_scroll(String text) {
+    encode_text(text);
+    int tw = totalSymbols * SYMBOL_SPACING + OLED_W;
+    for (int s = 0; s < tw; s += 2) {
+        oled.clearDisplay();
+        for (int i = 0; i < totalSymbols; i++) {
+            int cx = OLED_W + (i * SYMBOL_SPACING) - s;
+            if (cx > -SYMBOL_SPACING && cx < OLED_W + SYMBOL_SPACING)
+                draw_pvrsc_symbol(cx, CENTER_Y+6, encodedSymbols[i].theta,
+                                  encodedSymbols[i].stroke_count, encodedSymbols[i].dot_modifier);
+        }
+        oled.display();
+        if (Serial.available()) return;
+        delay(10);
+    }
+}
+
+// --- OLED typewriter reveal ---
+void display_decrypt_typewriter(String dec) {
+    for (int l = 1; l <= (int)dec.length(); l++) {
+        oled.clearDisplay();
+        oled.setTextSize(1); oled.setTextColor(SSD1306_WHITE);
+        oled.setCursor(0,0); oled.println(F("DECODING..."));
+        oled.drawLine(0,10,128,10,SSD1306_WHITE);
+        oled.setCursor(0,20); oled.setTextSize(2);
+        oled.print(dec.substring(0,l));
+        if (l < (int)dec.length()) oled.print('_');
+        oled.display(); delay(CHAR_BUILD_DELAY);
+    }
+    delay(PAUSE_AT_END);
+}
+
+// --- diagnostics ---
+void print_diagnostic_table() {
+    Serial.println(F("\n--- PVRSC REFERENCE TABLE ---"));
+    Serial.println(F("Char|ASCII|Theta    |Ni|Di|Sector"));
+    for (int i = 32; i <= 126; i++) {
+        PVRSCEncoding e = pvrsc_encode((char)i, 1, 12345);
+        Serial.print((char)i); Serial.print('|');
+        Serial.print(i); Serial.print('|');
+        Serial.print(e.theta,3); Serial.print('|');
+        Serial.print(e.stroke_count); Serial.print('|');
+        Serial.print(e.dot_modifier); Serial.print('|');
+        Serial.println(e.sector);
+    }
+}
+
+void print_collision_check() {
+    Serial.println(F("\n[COLLISION CHECK]..."));
+    bool col = false; uint32_t ts = 12345;
+    for (int p = 1; p <= 5; p++) {
+        for (int a = 32; a <= 126; a++) {
+            PVRSCEncoding ea = pvrsc_encode((char)a, p, ts);
+            for (int b = a+1; b <= 126; b++) {
+                PVRSCEncoding eb = pvrsc_encode((char)b, p, ts);
+                if (fabs(ea.theta-eb.theta)<0.001f && ea.stroke_count==eb.stroke_count
+                    && ea.dot_modifier==eb.dot_modifier) {
+                    Serial.print(F("COLLISION ")); Serial.print((char)a);
+                    Serial.print(F(" vs ")); Serial.print((char)b);
+                    Serial.print(F(" pos ")); Serial.println(p);
+                    col = true;
+                }
+            }
+        }
+        Serial.print(F("Pos ")); Serial.print(p); Serial.println(F(" OK"));
+    }
+    if (!col) Serial.println(F("0 collisions — 100% reliable"));
+}
+
+// --- PVRSC command handler ---
+void process_serial_command(String input) {
+    input.trim();
+    if (input.startsWith("E:")) {
+        currentText = input.substring(2);
+        pvrscMode = SYS_ENCRYPT;
+        Serial.print(F("[ENCRYPT] ")); Serial.println(currentText);
+    } else if (input == "D:AUTO") {
+        pvrscMode = SYS_DECRYPT;
+        if (totalSymbols == 0) { Serial.println(F("No data. Encrypt first.")); return; }
+        lastDecrypted = pvrsc_decrypt_string(encryptedPackets, totalSymbols);
+        Serial.print(F("[VERIFY] Orig: ")); Serial.println(currentText);
+        Serial.print(F("[VERIFY] Dec:  ")); Serial.println(lastDecrypted);
+        Serial.println(currentText == lastDecrypted ? F("MATCH!") : F("MISMATCH"));
+        display_decrypt_typewriter(lastDecrypted);
+        pvrscMode = SYS_ENCRYPT;
+    } else if (input.startsWith("D:")) {
+        int c1 = input.indexOf(':', 2), c2 = input.indexOf(':', c1+1);
+        if (c2 == -1) { Serial.println(F("Format: D:<seed>:<data>")); return; }
+        uint32_t sd = (uint32_t)input.substring(c1+1, c2).toInt();
+        lastDecrypted = pvrsc_decrypt_from_serial(input.substring(c2+1), sd);
+        display_decrypt_typewriter(lastDecrypted);
+        pvrscMode = SYS_ENCRYPT;
+    } else if (input.startsWith("SEED:")) {
+        received_seed = (uint32_t)input.substring(5).toInt();
+        Serial.print(F("SEED SET: ")); Serial.println(received_seed);
+    } else if (input.startsWith("CIPHER:")) {
+        if (received_seed == 0) { Serial.println(F("Set SEED first")); return; }
+        lastDecrypted = pvrsc_decrypt_from_serial(input.substring(7), received_seed);
+        Serial.print(F("DECRYPTED: ")); Serial.println(lastDecrypted);
+        display_decrypt_typewriter(lastDecrypted);
+    } else if (input == "DIAG")  { print_diagnostic_table(); }
+      else if (input == "CHECK") { print_collision_check(); }
+      else if (input == "HELP")  {
+        Serial.println(F("\nPVRSC COMMANDS:"));
+        Serial.println(F(" E:<text>         Encrypt"));
+        Serial.println(F(" D:AUTO           Decrypt last"));
+        Serial.println(F(" D:<seed>:<data>  Manual decrypt"));
+        Serial.println(F(" SEED:<val>       Set seed"));
+        Serial.println(F(" CIPHER:<data>    Decrypt w/ seed"));
+        Serial.println(F(" DIAG / CHECK / HELP"));
+        Serial.println(F(" 0                Back to menu"));
+    }
+}
+
+/*================================================================
+ *          MODE 2 — MAGIC SQUARE CIPHER  GLOBALS & FUNCTIONS
+ *================================================================*/
+#define MAX_N     31
+#define MAX_SZ    (MAX_N * MAX_N)
+#define SCROLL_MS 1200
+#define ALPHA     95
+#define ROUNDS    4
+
+static int     sq[MAX_N][MAX_N];
+static char    mx[MAX_N][MAX_N];
+static int     pr[MAX_SZ + 1];
+static int     pc[MAX_SZ + 1];
+static char    ebuf[MAX_SZ + 1];
+static char    dbuf_ms[MAX_SZ + 1];
+static char    tbuf[MAX_SZ + 1];
+static uint8_t sbox_ms[ALPHA];
+static uint8_t isbox_ms[ALPHA];
+
+void genSbox() {
+    for (int i = 0; i < ALPHA; i++) sbox_ms[i] = (uint8_t)i;
+    uint32_t seed = 0xA5C3E1B7UL;
+    for (int i = ALPHA-1; i > 0; i--) {
+        seed = seed * 1103515245UL + 12345UL;
+        int j = (int)(((seed >> 16) & 0xFFFF) % (uint32_t)(i + 1));
+        uint8_t t = sbox_ms[i]; sbox_ms[i] = sbox_ms[j]; sbox_ms[j] = t;
+    }
+    for (int i = 0; i < ALPHA; i++) isbox_ms[sbox_ms[i]] = (uint8_t)i;
+}
+
+static inline uint8_t keyVal(int pos, int rnd, int n) {
+    uint32_t h = (uint32_t)(pos+1)*7 + (uint32_t)(rnd+1)*13 + (uint32_t)n*31;
+    h *= 2654435761UL;
+    return (uint8_t)((h >> 16) % ALPHA);
+}
+
+void buildSquare(int n) {
+    for (int i = 0; i < n; i++) memset(sq[i], 0, sizeof(int)*n);
+    int r = 0, c = n/2;
+    for (int v = 1; v <= n*n; v++) {
+        sq[r][c] = v;
+        int nr = (r-1+n)%n, nc = (c+1)%n;
+        if (sq[nr][nc]) { nr = (r+1)%n; nc = c; }
+        r = nr; c = nc;
+    }
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++) { pr[sq[i][j]] = i; pc[sq[i][j]] = j; }
+}
+
+int calcN(int len) { int n = 3; while (n*n < len) n += 2; return n; }
+
+char padAt(int idx) {
+    int cy = idx/26, p = idx%26;
+    return (cy & 1) ? (char)('z'-p) : (char)('a'+p);
+}
+
+void readDiag(int n, char* buf) {
+    int k = 0;
+    for (int d = 0; d < 2*n-1; d++) {
+        int rs = (d < n) ? d : n-1, re = (d < n) ? 0 : d-n+1;
+        for (int r = rs; r >= re; r--) buf[k++] = mx[r][d-r];
+    }
+    buf[k] = '\0';
+}
+
+void writeDiag(int n, const char* buf) {
+    int k = 0;
+    for (int d = 0; d < 2*n-1; d++) {
+        int rs = (d < n) ? d : n-1, re = (d < n) ? 0 : d-n+1;
+        for (int r = rs; r >= re; r--) mx[r][d-r] = buf[k++];
+    }
+}
+
+void applyEnc(char* buf, int len, int n) {
+    for (int rnd = 0; rnd < ROUNDS; rnd++) {
+        for (int i = 0; i < len; i++) {
+            int v = (int)buf[i]-32; if (v<0)v=0; if (v>=ALPHA)v=ALPHA-1;
+            buf[i] = (char)(sbox_ms[v]+32);
+        }
+        for (int i = 0; i < len; i++) {
+            int v = (int)buf[i]-32;
+            buf[i] = (char)(((v + keyVal(i,rnd,n)) % ALPHA) + 32);
+        }
+        if (rnd % 2 == 0) {
+            for (int i = 1; i < len; i++) {
+                int v=(int)buf[i]-32, p=(int)buf[i-1]-32;
+                buf[i]=(char)(((v+p)%ALPHA)+32);
+            }
+        } else {
+            for (int i = len-2; i >= 0; i--) {
+                int v=(int)buf[i]-32, p=(int)buf[i+1]-32;
+                buf[i]=(char)(((v+p)%ALPHA)+32);
+            }
+        }
+    }
+}
+
+void applyDec(char* buf, int len, int n) {
+    for (int rnd = ROUNDS-1; rnd >= 0; rnd--) {
+        if (rnd % 2 == 0) {
+            for (int i = len-1; i >= 1; i--) {
+                int v=(int)buf[i]-32, p=(int)buf[i-1]-32;
+                buf[i]=(char)((((v-p)%ALPHA+ALPHA)%ALPHA)+32);
+            }
+        } else {
+            for (int i = 0; i <= len-2; i++) {
+                int v=(int)buf[i]-32, p=(int)buf[i+1]-32;
+                buf[i]=(char)((((v-p)%ALPHA+ALPHA)%ALPHA)+32);
+            }
+        }
+        for (int i = 0; i < len; i++) {
+            int v=(int)buf[i]-32, k=keyVal(i,rnd,n);
+            buf[i]=(char)((((v-k)%ALPHA+ALPHA)%ALPHA)+32);
+        }
+        for (int i = 0; i < len; i++) {
+            int v = ((int)buf[i]-32 % ALPHA + ALPHA) % ALPHA;
+            buf[i] = (char)(isbox_ms[v]+32);
+        }
+    }
+}
+
+const char* doEncrypt(const char* msg, int mLen, int* outN) {
+    int n = calcN(mLen); *outN = n; buildSquare(n);
+    int pi = 0;
+    for (int v = 1; v <= n*n; v++)
+        mx[pr[v]][pc[v]] = (v <= mLen) ? msg[v-1] : padAt(pi++);
+    readDiag(n, ebuf);
+    memcpy(tbuf, ebuf, n*n+1);
+    applyEnc(ebuf, n*n, n);
+    return ebuf;
+}
+
+const char* doDecrypt(const char* cipher, int origLen, int* outN) {
+    int cLen = (int)strlen(cipher); int n = 3;
+    while (n*n < cLen) n += 2;
+    if (n*n != cLen) { *outN = 0; dbuf_ms[0] = '\0'; return dbuf_ms; }
+    *outN = n; buildSquare(n);
+    memcpy(dbuf_ms, cipher, cLen); dbuf_ms[cLen] = '\0';
+    applyDec(dbuf_ms, cLen, n);
+    writeDiag(n, dbuf_ms);
+    int len = (origLen <= n*n) ? origLen : n*n;
+    for (int v = 1; v <= len; v++) dbuf_ms[v-1] = mx[pr[v]][pc[v]];
+    dbuf_ms[len] = '\0';
+    return dbuf_ms;
+}
+
+void serialPrintTrunc(const char* s, int mx2) {
+    int len = (int)strlen(s);
+    if (len <= mx2) { Serial.print(s); return; }
+    for (int i = 0; i < mx2-3; i++) Serial.print(s[i]);
+    Serial.print(F("..."));
+}
+
+void serialSquare(int n) {
+    Serial.println(F(" Magic Square:"));
+    for (int i = 0; i < n; i++) {
+        Serial.print(F("  "));
+        for (int j = 0; j < n; j++) {
+            if (n*n>=10 && sq[i][j]<10) Serial.print(' ');
+            if (n*n>=100 && sq[i][j]<100) Serial.print(' ');
+            Serial.print(sq[i][j]);
+            if (j < n-1) Serial.print(' ');
+        }
+        Serial.println();
+    }
+}
+
+void serialMatrix(int n) {
+    Serial.println(F(" Char Matrix:"));
+    for (int i = 0; i < n; i++) {
+        Serial.print(F("  "));
+        for (int j = 0; j < n; j++) { Serial.print('['); Serial.print(mx[i][j]); Serial.print(']'); }
+        Serial.println();
+    }
+}
+
+void oledScroll(const char* title, const char* text) {
+    if (!oledOK) return;
+    int len = (int)strlen(text);
+    for (int s = 0; s < len; s += 5) {
+        oled.clearDisplay(); oled.setTextSize(1); oled.setTextColor(SSD1306_WHITE);
+        oled.setCursor(0,0); oled.print(title);
+        int cnt = ((s+5)<=len) ? 5 : (len-s);
+        int w = cnt*18, xo = (SCR_W-w)/2; if (xo<0) xo=0;
+        oled.setTextSize(3); oled.setCursor(xo, 22);
+        for (int i = 0; i < cnt; i++) oled.print(text[s+i]);
+        oled.setTextSize(1); oled.setCursor(0,56);
+        oled.print(s+1); oled.print('-'); oled.print(s+cnt);
+        oled.print('/'); oled.print(len);
+        oled.display(); delay(SCROLL_MS);
+    }
+    oled.clearDisplay(); oled.setTextSize(1); oled.setTextColor(SSD1306_WHITE);
+    oled.setCursor(0,0); oled.println(title); oled.setCursor(0,12);
+    for (int i = 0; i < len && i < 84; i++) oled.print(text[i]);
+    if (len > 84) oled.print(F(".."));
+    oled.display();
+}
+
+void oledMatrix(int n) {
+    if (!oledOK || n > 5) return;
+    oled.clearDisplay(); oled.setTextColor(SSD1306_WHITE);
+    if (n <= 3) {
+        oled.setTextSize(2);
+        for (int i=0;i<n;i++) for (int j=0;j<n;j++) {
+            oled.setCursor(j*42+9, i*20+2); oled.print(mx[i][j]);
+        }
+    } else {
+        oled.setTextSize(1); oled.setCursor(0,0);
+        oled.print(n); oled.print('x'); oled.print(n); oled.println(F(" Matrix:"));
+        int cw=SCR_W/n, ch=50/n;
+        for (int i=0;i<n;i++) for (int j=0;j<n;j++) {
+            oled.setCursor(j*cw+cw/2-3, 12+i*ch); oled.print(mx[i][j]);
+        }
+    }
+    oled.display(); delay(2500);
+}
+
+void selfTest() {
+    Serial.println(F("\n===== MS SELF-TEST (SPN v3) ====="));
+    const char* inputs[] = {
+        "hellow","a","abcdefghi","helloworld","Hello, World! 123",
+        "abcdefghijklmnopqrstuvwxy","abcdefghijklmnopqrstuvwxyz",
+        "The quick brown fox jumps!","!@#$%^&*()_+-=[]{}|;':,./<>?",
+        "A B C D E F G H I J K L M"
+    };
+    int numT = sizeof(inputs)/sizeof(inputs[0]); int passed = 0;
+    for (int t = 0; t < numT; t++) {
+        int n1=0,n2=0;
+        const char* ci = doEncrypt(inputs[t], (int)strlen(inputs[t]), &n1);
+        const char* pl = doDecrypt(ci, (int)strlen(inputs[t]), &n2);
+        bool ok = (strcmp(pl, inputs[t]) == 0);
+        if (ok) passed++;
+        Serial.print(ok ? F(" PASS") : F(" FAIL"));
+        Serial.print(F(" [")); Serial.print(t+1);
+        Serial.print(F("] \"")); serialPrintTrunc(inputs[t], 25);
+        Serial.println('"');
+    }
+    Serial.print(F("\nResult: ")); Serial.print(passed); Serial.print('/');
+    Serial.print(numT); Serial.println(passed==numT ? F(" ALL PASSED!") : F(" SOME FAILED"));
+    Serial.println(F("================================="));
+}
+
+void showMSMenu() {
+    Serial.println(F("\n========================================"));
+    Serial.println(F(" MAGIC SQUARE CIPHER v3 [SPN Enhanced]"));
+    Serial.println(F("========================================"));
+    Serial.println(F(" Encrypt: type message + Enter"));
+    Serial.println(F(" Decrypt: D:<cipher>:<orig_length>"));
+    Serial.println(F(" 0 = back to main menu"));
+    Serial.println(F("========================================"));
+    Serial.print(F(">> "));
+}
+
+/*================================================================
+ *       MODE 3 — FRACTAL ATBASH CIPHER  GLOBALS & FUNCTIONS
+ *  (Matched exactly to standalone Fractal Atbash Cipher v3.0)
+ *================================================================*/
+#define FA_MAX_MSG     256
+#define FA_NUM_ROUNDS  4
+#define FA_WARMUP      300
+#define FA_KEY_LEN     16
+#define FA_SCR_SPEED   2
+#define FA_SCR_INTERVAL 40
+
+static const uint8_t FA_MASTER_KEY[FA_KEY_LEN] = {
+    0x4F,0x9A,0x2C,0x7E, 0x1B,0xD3,0x68,0xF5,
+    0xA1,0x3D,0x82,0x56, 0xC9,0x07,0xE4,0xBB
+};
+
+static uint8_t FA_SBOX[256], FA_INV_SBOX[256];
+static uint8_t FA_RK[FA_NUM_ROUNDS][FA_MAX_MSG];
+static uint8_t FA_ROTV[FA_NUM_ROUNDS];
+static uint8_t fa_pBuf[FA_MAX_MSG], fa_cBuf[FA_MAX_MSG], fa_dBuf[FA_MAX_MSG];
+
+static bool    fa_scrollOn = false;
+static String  fa_scrText = "";
+static int     fa_scrX, fa_scrDataLen;
+static unsigned long fa_scrTimer;
+static char    fa_scrMode = ' ';
+static int     fa_scrCharW;
+
+static inline uint8_t fa_rl8(uint8_t v, uint8_t n) { n&=7; return n ? (uint8_t)((v<<n)|(v>>(8-n))) : v; }
+static inline uint8_t fa_rr8(uint8_t v, uint8_t n) { n&=7; return n ? (uint8_t)((v>>n)|(v<<(8-n))) : v; }
+
+/* ================ PRINT HELPERS ================ */
+void fa_sep() {
+    Serial.println(F("================================================"));
+}
+
+void fa_sepLight() {
+    Serial.println(F(" ----------------------------------------------"));
+}
+
+void fa_printHex(const uint8_t *d, int len) {
+    for (int i = 0; i < len; i++) {
+        if (d[i] < 0x10) Serial.print('0');
+        Serial.print(d[i], HEX);
+        Serial.print(' ');
+        if ((i + 1) % 16 == 0 && i < len - 1) Serial.println(F("  "));
+    }
+    Serial.println();
+}
+
+void fa_printHexShort(const uint8_t *d, int len) {
+    int show = (len < 8) ? len : 8;
+    for (int i = 0; i < show; i++) {
+        if (d[i] < 0x10) Serial.print('0');
+        Serial.print(d[i], HEX); Serial.print(' ');
+    }
+    if (len > 8) Serial.print(F("..."));
+    Serial.println();
+}
+
+String fa_toHexSpaced(const uint8_t *d, int len) {
+    String s = "";
+    for (int i = 0; i < len; i++) {
+        if (d[i] < 0x10) s += '0';
+        s += String(d[i], HEX);
+        if (i < len - 1) s += ' ';
+    }
+    s.toUpperCase();
+    return s;
+}
+
+String fa_toHexCompact(const uint8_t *d, int len) {
+    String s = "";
+    for (int i = 0; i < len; i++) {
+        if (d[i] < 0x10) s += '0';
+        s += String(d[i], HEX);
+    }
+    s.toUpperCase();
+    return s;
+}
+
+int fa_parseHex(const String &hs, uint8_t *out, int maxLen) {
+    int len = 0, nib = -1;
+    for (unsigned int i = 0; i < hs.length() && len < maxLen; i++) {
+        char c = hs.charAt(i); int v = -1;
+        if (c >= '0' && c <= '9') v = c - '0';
+        else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
+        else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+        else continue;
+        if (nib < 0) nib = v;
+        else { out[len++] = (uint8_t)((nib << 4) | v); nib = -1; }
+    }
+    return len;
+}
+
+/* ==================================================== 
+ * S-BOX — 3-Level Segmented Atbash + Key Shuffle
+ * ==================================================== */
+void fa_buildSBox(const uint8_t *key, int kl) {
+    int i; uint8_t t;
+    for (i = 0; i < 256; i++) FA_SBOX[i] = (uint8_t)i;
+    /* Level 1 — full reversal */
+    for (i = 0; i < 128; i++) {
+        t = FA_SBOX[i]; FA_SBOX[i] = FA_SBOX[255 - i]; FA_SBOX[255 - i] = t;
+    }
+    /* Level 2 — 2 × 128 reversal */
+    for (int s = 0; s < 2; s++) {
+        int b = s * 128;
+        for (i = 0; i < 64; i++) {
+            t = FA_SBOX[b + i]; FA_SBOX[b + i] = FA_SBOX[b + 127 - i];
+            FA_SBOX[b + 127 - i] = t;
+        }
+    }
+    /* Level 3 — 4 × 64 reversal */
+    for (int s = 0; s < 4; s++) {
+        int b = s * 64;
+        for (i = 0; i < 32; i++) {
+            t = FA_SBOX[b + i]; FA_SBOX[b + i] = FA_SBOX[b + 63 - i];
+            FA_SBOX[b + 63 - i] = t;
+        }
+    }
+    /* Level 4 — key-dependent Fisher-Yates */
+    uint32_t rng = 0x5A3C96E1;
+    for (i = 0; i < kl; i++) {
+        rng ^= ((uint32_t)key[i]) << ((i & 3) * 8);
+        rng = rng * 2654435761U + 1;
+    }
+    for (i = 255; i > 0; i--) {
+        rng = rng * 2654435761U + 1;
+        uint32_t j = ((rng >> 8) & 0xFFFF) % ((uint32_t)i + 1);
+        t = FA_SBOX[i]; FA_SBOX[i] = FA_SBOX[j]; FA_SBOX[j] = t;
+    }
+    /* inverse */
+    for (i = 0; i < 256; i++) FA_INV_SBOX[FA_SBOX[i]] = (uint8_t)i;
+}
+
+bool fa_verifySBox() {
+    uint8_t seen[256] = {0};
+    for (int i = 0; i < 256; i++) {
+        if (seen[FA_SBOX[i]]) return false;
+        seen[FA_SBOX[i]] = 1;
+        if (FA_INV_SBOX[FA_SBOX[i]] != (uint8_t)i) return false;
+    }
+    return true;
+}
+
+/* ================= KEY SCHEDULE ================= */
+void fa_genKeys(const uint8_t *key, int kl) {
+    double x = 0;
+    for (int i = 0; i < kl; i++)
+        x += (double)(key[i] + 1) / (257.0 + (double)i);
+    x = fmod(fabs(x), 0.8) + 0.1;
+    const double r = 3.99999;
+    for (int i = 0; i < FA_WARMUP; i++) x = r * x * (1.0 - x);
+    for (int rnd = 0; rnd < FA_NUM_ROUNDS; rnd++) {
+        for (int i = 0; i < FA_MAX_MSG; i++) {
+            x = r * x * (1.0 - x);
+            FA_RK[rnd][i] = (uint8_t)(x * 255.0);
+        }
+        x = r * x * (1.0 - x);
+        FA_ROTV[rnd] = 1 + ((uint8_t)(x * 255.0) % 7);
+    }
+}
+
+bool fa_initCipher(const uint8_t *key, int kl) {
+    fa_buildSBox(key, kl);
+    if (!fa_verifySBox()) return false;
+    fa_genKeys(key, kl);
+    return true;
+}
+
+/* ==================================================== 
+ * ENCRYPT — regular (for metrics)
+ * ==================================================== */
+void fa_fractalEncrypt(const uint8_t *in, uint8_t *out, int len) {
+    memcpy(out, in, len);
+    for (int rnd = 0; rnd < FA_NUM_ROUNDS; rnd++) {
+        uint8_t rot = FA_ROTV[rnd];
+        for (int i = 0; i < len; i++) out[i] ^= FA_RK[rnd][i];
+        for (int i = 0; i < len; i++) out[i] = FA_SBOX[out[i]];
+        for (int i = 0; i < len; i++) out[i] = fa_rl8(out[i], (rot + i) & 7);
+        if (len > 1)
+            for (int i = 1; i < len; i++)
+                out[i] ^= fa_rl8(out[i - 1], 3);
+        if (len > 1)
+            for (int i = len - 2; i >= 0; i--)
+                out[i] ^= fa_rl8(out[i + 1], 5);
+    }
+}
+
+/* ==================================================== 
+ * DECRYPT — regular (for metrics)
+ * ==================================================== */
+void fa_fractalDecrypt(const uint8_t *in, uint8_t *out, int len) {
+    memcpy(out, in, len);
+    for (int rnd = FA_NUM_ROUNDS - 1; rnd >= 0; rnd--) {
+        uint8_t rot = FA_ROTV[rnd];
+        if (len > 1)
+            for (int i = 0; i <= len - 2; i++)
+                out[i] ^= fa_rl8(out[i + 1], 5);
+        if (len > 1)
+            for (int i = len - 1; i >= 1; i--)
+                out[i] ^= fa_rl8(out[i - 1], 3);
+        for (int i = 0; i < len; i++) out[i] = fa_rr8(out[i], (rot + i) & 7);
+        for (int i = 0; i < len; i++) out[i] = FA_INV_SBOX[out[i]];
+        for (int i = 0; i < len; i++) out[i] ^= FA_RK[rnd][i];
+    }
+}
+
+/* ==================================================== 
+ * VERBOSE ENCRYPT — prints every step to Serial
+ * ==================================================== */
+void fa_encryptVerbose(const uint8_t *in, uint8_t *out, int len) {
+    memcpy(out, in, len);
+    Serial.println(F("\n  ====== ENCRYPTION PROCESS ======"));
+    for (int rnd = 0; rnd < FA_NUM_ROUNDS; rnd++) {
+        uint8_t rot = FA_ROTV[rnd];
+        Serial.print(F("  Round "));
+        Serial.print(rnd + 1); Serial.print('/');
+        Serial.print(FA_NUM_ROUNDS);
+        Serial.print(F(" [rot=")); Serial.print(rot);
+        Serial.println(F("]"));
+
+        for (int i = 0; i < len; i++) out[i] ^= FA_RK[rnd][i];
+        Serial.print(F("   AddRoundKey  : "));
+        fa_printHexShort(out, len);
+
+        for (int i = 0; i < len; i++) out[i] = FA_SBOX[out[i]];
+        Serial.print(F("   SubBytes     : "));
+        fa_printHexShort(out, len);
+
+        for (int i = 0; i < len; i++) out[i] = fa_rl8(out[i], (rot + i) & 7);
+        Serial.print(F("   RotateBits   : "));
+        fa_printHexShort(out, len);
+
+        if (len > 1)
+            for (int i = 1; i < len; i++) out[i] ^= fa_rl8(out[i - 1], 3);
+        Serial.print(F("   CascadeFwd   : "));
+        fa_printHexShort(out, len);
+
+        if (len > 1)
+            for (int i = len - 2; i >= 0; i--) out[i] ^= fa_rl8(out[i + 1], 5);
+        Serial.print(F("   CascadeBwd   : "));
+        fa_printHexShort(out, len);
+
+        Serial.println();
+    }
+    Serial.println(F("  ================================"));
+}
+
+/* ==================================================== 
+ * VERBOSE DECRYPT — prints every inverse step
+ * ==================================================== */
+void fa_decryptVerbose(const uint8_t *in, uint8_t *out, int len) {
+    memcpy(out, in, len);
+    Serial.println(F("\n  ====== DECRYPTION PROCESS ======"));
+    for (int rnd = FA_NUM_ROUNDS - 1; rnd >= 0; rnd--) {
+        uint8_t rot = FA_ROTV[rnd];
+        Serial.print(F("  Round "));
+        Serial.print(rnd + 1); Serial.print('/');
+        Serial.print(FA_NUM_ROUNDS);
+        Serial.print(F(" (inv) [rot=")); Serial.print(rot);
+        Serial.println(F("]"));
+
+        if (len > 1)
+            for (int i = 0; i <= len - 2; i++) out[i] ^= fa_rl8(out[i + 1], 5);
+        Serial.print(F("   InvCascBwd   : "));
+        fa_printHexShort(out, len);
+
+        if (len > 1)
+            for (int i = len - 1; i >= 1; i--) out[i] ^= fa_rl8(out[i - 1], 3);
+        Serial.print(F("   InvCascFwd   : "));
+        fa_printHexShort(out, len);
+
+        for (int i = 0; i < len; i++) out[i] = fa_rr8(out[i], (rot + i) & 7);
+        Serial.print(F("   InvRotBits   : "));
+        fa_printHexShort(out, len);
+
+        for (int i = 0; i < len; i++) out[i] = FA_INV_SBOX[out[i]];
+        Serial.print(F("   InvSubBytes  : "));
+        fa_printHexShort(out, len);
+
+        for (int i = 0; i < len; i++) out[i] ^= FA_RK[rnd][i];
+        Serial.print(F("   InvAddRndKey : "));
+        fa_printHexShort(out, len);
+
+        Serial.println();
+    }
+    Serial.println(F("  ================================"));
+}
+
+/* ================ EVALUATION METRICS =============== */
+float fa_calcEntropy(const uint8_t *d, int len) {
+    int f[256] = {0};
+    for (int i = 0; i < len; i++) f[d[i]]++;
+    float H = 0;
+    for (int i = 0; i < 256; i++)
+        if (f[i] > 0) { float p = (float)f[i] / len; H -= p * log2f(p); }
+    return H;
+}
+
+float fa_calcAvalanche(const uint8_t *plain, int len) {
+    static uint8_t m[FA_MAX_MSG], c1[FA_MAX_MSG], c2[FA_MAX_MSG];
+    fa_fractalEncrypt(plain, c1, len);
+    int bits = ((len < 8) ? len : 8) * 8;
+    long changed = 0, total = 0;
+    for (int b = 0; b < bits; b++) {
+        memcpy(m, plain, len);
+        m[b >> 3] ^= (1 << (b & 7));
+        fa_fractalEncrypt(m, c2, len);
+        for (int i = 0; i < len; i++) {
+            uint8_t d = c1[i] ^ c2[i];
+            while (d) { changed += d & 1; d >>= 1; }
+        }
+        total += (long)len * 8;
+    }
+    return (float)changed / total * 100.0f;
+}
+
+float fa_calcCorrelation(const uint8_t *a, const uint8_t *b, int len) {
+    float sa=0,sb=0,sab=0,sa2=0,sb2=0;
+    for (int i = 0; i < len; i++) {
+        float fa = a[i], fb = b[i];
+        sa+=fa; sb+=fb; sab+=fa*fb; sa2+=fa*fa; sb2+=fb*fb;
+    }
+    float n = len;
+    float num = n * sab - sa * sb;
+    float den = sqrtf((n*sa2-sa*sa) * (n*sb2-sb*sb));
+    return den < 1e-10f ? 0.0f : num / den;
+}
+
+float fa_calcKeySens(const uint8_t *plain, int len) {
+    static uint8_t svS[256], svI[256], svR[FA_NUM_ROUNDS];
+    static uint8_t svK[FA_NUM_ROUNDS][FA_MAX_MSG];
+    static uint8_t c1[FA_MAX_MSG], c2[FA_MAX_MSG];
+    memcpy(svS, FA_SBOX, 256); memcpy(svI, FA_INV_SBOX, 256);
+    memcpy(svK, FA_RK, sizeof(FA_RK)); memcpy(svR, FA_ROTV, FA_NUM_ROUNDS);
+    fa_fractalEncrypt(plain, c1, len);
+    uint8_t mk[FA_KEY_LEN]; memcpy(mk, FA_MASTER_KEY, FA_KEY_LEN);
+    mk[0] ^= 0x01;
+    fa_initCipher(mk, FA_KEY_LEN);
+    fa_fractalEncrypt(plain, c2, len);
+    memcpy(FA_SBOX, svS, 256); memcpy(FA_INV_SBOX, svI, 256);
+    memcpy(FA_RK, svK, sizeof(FA_RK)); memcpy(FA_ROTV, svR, FA_NUM_ROUNDS);
+    int diff = 0;
+    for (int i = 0; i < len; i++) {
+        uint8_t d = c1[i] ^ c2[i];
+        while (d) { diff += d & 1; d >>= 1; }
+    }
+    return (float)diff / (len * 8.0f) * 100.0f;
+}
+
+void fa_calcNPCR_UACI(const uint8_t *plain, int len, float &npcr, float &uaci) {
+    static uint8_t m[FA_MAX_MSG], c1[FA_MAX_MSG], c2[FA_MAX_MSG];
+    fa_fractalEncrypt(plain, c1, len);
+    memcpy(m, plain, len); m[0] ^= 0x01;
+    fa_fractalEncrypt(m, c2, len);
+    int ch = 0; float ds = 0;
+    for (int i = 0; i < len; i++) {
+        if (c1[i] != c2[i]) ch++;
+        ds += (float)abs((int)c1[i] - (int)c2[i]);
+    }
+    npcr = (float)ch / len * 100.0f;
+    uaci = ds / (len * 255.0f) * 100.0f;
+}
+
+void fa_printMetrics(const uint8_t *plain, const uint8_t *cipher, int len) {
+    Serial.println(F("\n  ====== EVALUATION METRICS ======"));
+    Serial.print(F("  Entropy (P->C) : "));
+    Serial.print(fa_calcEntropy(plain, len), 2);
+    Serial.print(F(" -> "));
+    Serial.print(fa_calcEntropy(cipher, len), 2);
+    Serial.println(F(" b/B"));
+
+    Serial.print(F("  Avalanche      : "));
+    Serial.print(fa_calcAvalanche(plain, len), 2);
+    Serial.println(F("% (ideal 50%)"));
+
+    Serial.print(F("  Correlation    : "));
+    Serial.print(fa_calcCorrelation(plain, cipher, len), 4);
+    Serial.println(F(" (ideal 0.00)"));
+
+    Serial.print(F("  Key Sensitivity: "));
+    Serial.print(fa_calcKeySens(plain, len), 2);
+    Serial.println(F("% (ideal 50%)"));
+
+    float npcr, uaci;
+    fa_calcNPCR_UACI(plain, len, npcr, uaci);
+    Serial.print(F("  NPCR           : "));
+    Serial.print(npcr, 2);
+    Serial.println(F("% (ideal 99.61%)"));
+
+    Serial.print(F("  UACI           : "));
+    Serial.print(uaci, 2);
+    Serial.println(F("% (ideal 33.46%)"));
+
+    Serial.println(F("  ================================"));
+}
+
+/* ==================================================== 
+ * OLED DISPLAY FUNCTIONS
+ * ==================================================== */
+void fa_oledSplash() {
+    oled.clearDisplay();
+    oled.setTextColor(SSD1306_WHITE);
+    oled.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+    oled.drawRect(2, 2, 124, 60, SSD1306_WHITE);
+    oled.setTextSize(1);
+    oled.setCursor(14, 6);
+    oled.print(F("FRACTAL ATBASH"));
+    oled.setTextSize(1);
+    oled.setCursor(10, 18);
+    oled.print(F("CIPHER"));
+    oled.setTextSize(1);
+    oled.setCursor(46, 38);
+    oled.print(F("v3.0"));
+    oled.setCursor(10, 50);
+    oled.print(F("ESP32 IoT Crypto"));
+    oled.display();
+}
+
+void fa_oledReady() {
+    oled.clearDisplay();
+    oled.setTextColor(SSD1306_WHITE);
+    oled.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+    oled.setTextSize(1);
+    oled.setCursor(4, 4);
+    oled.print(F("FRACTAL ATBASH v3.0"));
+    oled.drawLine(4, 14, 123, 14, SSD1306_WHITE);
+    oled.setCursor(4, 19);
+    oled.print(F("Commands:"));
+    oled.setCursor(4, 31);
+    oled.print(F("E:<msg>  Encrypt"));
+    oled.setCursor(4, 43);
+    oled.print(F("D:<hex>  Decrypt"));
+    oled.setCursor(28, 54);
+    oled.print(F("READY..."));
+    oled.display();
+    fa_scrollOn = false;
+}
+
+void fa_oledProcessing(bool encrypting) {
+    oled.clearDisplay();
+    oled.setTextColor(SSD1306_WHITE);
+    oled.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+    oled.setTextSize(1);
+    oled.setCursor(4, 4);
+    oled.print(F("FRACTAL ATBASH v3.0"));
+    oled.drawLine(4, 14, 123, 14, SSD1306_WHITE);
+    oled.setTextSize(1);
+    oled.setCursor(4, 20);
+    oled.print(encrypting ? F("MODE: ENCRYPT") : F("MODE: DECRYPT"));
+    /* animated dots */
+    for (int f = 0; f < 3; f++) {
+        oled.fillRect(4, 36, 120, 20, SSD1306_BLACK);
+        oled.setTextSize(2);
+        oled.setCursor(8, 38);
+        String dots = "WORKING";
+        for (int d = 0; d <= f; d++) dots += ".";
+        oled.print(dots);
+        oled.display();
+        delay(200);
+    }
+}
+
+void fa_startScroll(char mode, const String &text, int dataLen) {
+    fa_scrMode = mode;
+    fa_scrText = text;
+    fa_scrDataLen = dataLen;
+    fa_scrX = SCREEN_W;
+    fa_scrollOn = true;
+    fa_scrTimer = millis();
+    fa_scrCharW = (mode == 'D') ? 12 : 6; /* size 2 : size 1 */
+}
+
+void fa_updateScroll() {
+    if (!fa_scrollOn) return;
+    if (millis() - fa_scrTimer < FA_SCR_INTERVAL) return;
+    fa_scrTimer = millis();
+
+    oled.clearDisplay();
+    oled.setTextColor(SSD1306_WHITE);
+
+    /* --- header --- */
+    oled.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+    oled.setTextSize(1);
+    oled.setCursor(4, 3);
+    oled.print(F("FRACTAL ATBASH v3.0"));
+    oled.drawLine(4, 12, 123, 12, SSD1306_WHITE);
+
+    /* --- mode label --- */
+    oled.setCursor(4, 15);
+    if (fa_scrMode == 'E') {
+        oled.print(F("[ENCRYPTED] "));
+    } else {
+        oled.print(F("[DECRYPTED] "));
+    }
+    oled.print(fa_scrDataLen);
+    oled.print(F("B"));
+    oled.drawLine(4, 25, 123, 25, SSD1306_WHITE);
+
+    /* --- scrolling text area (y 28–47) --- */
+    if (fa_scrMode == 'D') {
+        oled.setTextSize(2); /* big plaintext */
+        oled.setCursor(fa_scrX, 29);
+    } else {
+        oled.setTextSize(2); /* compact hex */
+        oled.setCursor(fa_scrX, 33);
+    }
+    oled.print(fa_scrText);
+
+    oled.drawLine(4, 49, 123, 49, SSD1306_WHITE);
+
+    /* --- scroll indicator + progress bar --- */
+    oled.setTextSize(1);
+    oled.setCursor(4, 53);
+    oled.print(F("<<< SCROLL >>>"));
+
+    int textW = fa_scrText.length() * fa_scrCharW;
+    int totalTr = SCREEN_W + textW;
+    int traveled = SCREEN_W - fa_scrX;
+    if (totalTr > 0 && traveled >= 0) {
+        int barW = map(constrain(traveled, 0, totalTr),
+                       0, totalTr, 0, 118);
+        oled.fillRect(5, 60, barW, 2, SSD1306_WHITE);
+    }
+
+    oled.display();
+
+    /* --- advance position --- */
+    fa_scrX -= FA_SCR_SPEED;
+    if (fa_scrX < -textW) fa_scrX = SCREEN_W; /* loop */
+}
+
+/* ==================================================== 
+ * COMMAND: E:<message>
+ * ==================================================== */
+void fa_handleEncrypt(const String &msg) {
+    int len = msg.length();
+    if (len == 0 || len >= FA_MAX_MSG) {
+        Serial.println(F(" ERROR: empty or too long (max 255)"));
+        return;
+    }
+    msg.getBytes(fa_pBuf, FA_MAX_MSG);
+
+    fa_sep();
+    Serial.println(F(" FRACTAL ATBASH CIPHER — ENCRYPT"));
+    fa_sep();
+    Serial.print(F(" Input text  : \""));
+    Serial.print(msg); Serial.println('"');
+    Serial.print(F(" Length      : "));
+    Serial.print(len); Serial.println(F(" bytes"));
+    Serial.print(F(" Input hex   : "));
+    fa_printHex(fa_pBuf, len);
+
+    /* OLED animation */
+    fa_oledProcessing(true);
+
+    /* encrypt with verbose trace */
+    unsigned long t0 = micros();
+    fa_encryptVerbose(fa_pBuf, fa_cBuf, len);
+    unsigned long tEnc = micros() - t0;
+
+    /* output */
+    Serial.println(F("\n  ====== OUTPUT ======"));
+    Serial.print(F("  Ciphertext : "));
+    fa_printHex(fa_cBuf, len);
+    Serial.print(F("  Time       : "));
+    Serial.print(tEnc); Serial.println(F(" us"));
+
+    String hexC = fa_toHexCompact(fa_cBuf, len);
+    Serial.print(F("  Paste to D : D:"));
+    Serial.println(hexC);
+
+    /* verify */
+    fa_fractalDecrypt(fa_cBuf, fa_dBuf, len);
+    fa_dBuf[len] = 0;
+    bool ok = (memcmp(fa_pBuf, fa_dBuf, len) == 0);
+    Serial.print(F("  Verify     : "));
+    Serial.println(ok ? F("PASS") : F("FAIL"));
+    Serial.println(F("  ===================="));
+
+    /* metrics */
+    fa_printMetrics(fa_pBuf, fa_cBuf, len);
+
+    /* start OLED scroll */
+    String hexDisp = fa_toHexSpaced(fa_cBuf, len);
+    fa_startScroll('E', hexDisp, len);
+
+    Serial.println(F("\n >> Ciphertext now scrolling on OLED <<"));
+    fa_sep();
+}
+
+/* ==================================================== 
+ * COMMAND: D:<hex string>
+ * ==================================================== */
+void fa_handleDecrypt(const String &hexInput) {
+    int len = fa_parseHex(hexInput, fa_cBuf, FA_MAX_MSG);
+    if (len == 0) {
+        Serial.println(F(" ERROR: no valid hex bytes parsed"));
+        return;
+    }
+
+    fa_sep();
+    Serial.println(F(" FRACTAL ATBASH CIPHER — DECRYPT"));
+    fa_sep();
+    Serial.print(F(" Ciphertext  : "));
+    fa_printHex(fa_cBuf, len);
+    Serial.print(F(" Length      : "));
+    Serial.print(len); Serial.println(F(" bytes"));
+
+    /* OLED animation */
+    fa_oledProcessing(false);
+
+    /* decrypt with verbose trace */
+    unsigned long t0 = micros();
+    fa_decryptVerbose(fa_cBuf, fa_dBuf, len);
+    unsigned long tDec = micros() - t0;
+    fa_dBuf[len] = 0;
+
+    /* output */
+    Serial.println(F("\n  ====== OUTPUT ======"));
+    Serial.print(F("  Plaintext  : \""));
+    Serial.print((char *)fa_dBuf); Serial.println('"');
+    Serial.print(F("  Plain hex  : "));
+    fa_printHex(fa_dBuf, len);
+    Serial.print(F("  Time       : "));
+    Serial.print(tDec); Serial.println(F(" us"));
+    Serial.println(F("  ===================="));
+
+    /* start OLED scroll */
+    fa_startScroll('D', String((char *)fa_dBuf), len);
+
+    Serial.println(F("\n >> Plaintext now scrolling on OLED <<"));
+    fa_sep();
+}
+
+/*================================================================
+ *                MAIN MENU / SETUP / LOOP
+ *================================================================*/
+void showMainMenu() {
+    oled.clearDisplay(); oled.setTextColor(SSD1306_WHITE);
+    oled.drawRect(0,0,128,64,SSD1306_WHITE);
+    oled.setTextSize(1);
+    oled.setCursor(10,4);  oled.print(F("TRIPLE CIPHER"));
+    oled.drawLine(4,14,123,14,SSD1306_WHITE);
+    oled.setCursor(4,18);  oled.print(F("1: PVRSC Cipher"));
+    oled.setCursor(4,30);  oled.print(F("2: Magic Square"));
+    oled.setCursor(4,42);  oled.print(F("3: Fractal Atbash"));
+    oled.setCursor(4,54);  oled.print(F("Enter 1, 2, or 3"));
+    oled.display();
+
+    Serial.println(F("\n================================================"));
+    Serial.println(F("       TRIPLE CIPHER SYSTEM — ESP32"));
+    Serial.println(F("================================================"));
+    Serial.println(F("  1 — PVRSC (Radial Stick Cipher)"));
+    Serial.println(F("  2 — Magic Square Cipher (SPN)"));
+    Serial.println(F("  3 — Fractal Atbash Cipher"));
+    Serial.println(F("================================================"));
+    Serial.println(F("  Enter 1, 2, or 3 to select mode:"));
+    Serial.print(F(">> "));
+}
+
+void setup() {
+    Serial.begin(115200);
+    Serial.setRxBufferSize(1024);
+    Serial.setTimeout(30000);
+    delay(500);
+
+    Wire.begin(I2C_SDA, I2C_SCL);
+    oledOK = oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADR);
+    if (!oledOK) Serial.println(F("[WARN] OLED not found"));
+
+    // Splash
+    oled.clearDisplay(); oled.setTextSize(1); oled.setTextColor(SSD1306_WHITE);
+    oled.setCursor(10,10); oled.println(F("TRIPLE CIPHER"));
+    oled.setCursor(10,25); oled.println(F("Initializing..."));
+    oled.display();
+
+    // Init Magic Square S-box
+    genSbox();
+
+    // Init Fractal Atbash cipher
+    Serial.print(F("\n [INIT] S-Box (4-level Atbash)... "));
+    if (!fa_initCipher(FA_MASTER_KEY, FA_KEY_LEN)) {
+        Serial.println(F("FATAL"));
+        while(1) delay(1000);
+    }
+    Serial.println(F("OK"));
+
+    Serial.print(F(" [INIT] Rounds: "));
+    Serial.print(FA_NUM_ROUNDS);
+    Serial.print(F("  Rotations: "));
+    for (int i = 0; i < FA_NUM_ROUNDS; i++) {
+        Serial.print(FA_ROTV[i]);
+        if (i < FA_NUM_ROUNDS - 1) Serial.print(F(", "));
+    }
+    Serial.println();
+
+    // Quick FA self-test
+    const char *test = "HELLO ESP32 FRACTAL CIPHER";
+    int tLen = strlen(test);
+    fa_fractalEncrypt((const uint8_t*)test, fa_cBuf, tLen);
+    fa_fractalDecrypt(fa_cBuf, fa_dBuf, tLen);
+    fa_dBuf[tLen] = 0;
+    bool ok = (memcmp(test, fa_dBuf, tLen) == 0);
+    Serial.print(F(" [TEST] \""));
+    Serial.print(test);
+    Serial.println(F("\""));
+    Serial.print(F(" [TEST] Cipher: "));
+    fa_printHexShort(fa_cBuf, tLen);
+    Serial.print(F(" [TEST] Decrypt: \""));
+    Serial.print((char *)fa_dBuf);
+    Serial.println('"');
+    Serial.print(F(" [TEST] Status: "));
+    Serial.println(ok ? F("PASS") : F("FAIL"));
+
+    delay(1000);
+    showMainMenu();
+}
+
+void loop() {
+    // ====================== MENU MODE ======================
+    if (activeMode == 0) {
+        if (Serial.available()) {
+            String in = Serial.readStringUntil('\n'); in.trim();
+            if (in == "1") {
+                activeMode = 1;
+                pvrscMode = SYS_ENCRYPT;
+                Serial.println(F("\n=== PVRSC MODE ==="));
+                Serial.println(F("Type HELP for commands, 0 to exit"));
+                oled.clearDisplay(); oled.setTextSize(1); oled.setTextColor(SSD1306_WHITE);
+                oled.setCursor(10,10); oled.println(F("PVRSC CIPHER"));
+                oled.setCursor(10,25); oled.println(F("WITH DECRYPTION"));
+                oled.setCursor(10,40); oled.println(F("Ready..."));
+                oled.display();
+            } else if (in == "2") {
+                activeMode = 2;
+                Serial.println(F("\n=== MAGIC SQUARE MODE ==="));
+                selfTest();
+                showMSMenu();
+                if (oledOK) {
+                    oled.clearDisplay(); oled.setTextSize(1); oled.setTextColor(SSD1306_WHITE);
+                    oled.setCursor(6,8); oled.println(F("Magic Sq Cipher"));
+                    oled.setCursor(14,24); oled.println(F("v3 SPN Enhanced"));
+                    oled.setCursor(4,48); oled.println(F("Awaiting input..."));
+                    oled.display();
+                }
+            } else if (in == "3") {
+                activeMode = 3;
+                fa_scrollOn = false;
+                fa_sep();
+                Serial.println(F(" FRACTAL ATBASH CIPHER v3.0"));
+                Serial.println(F(" ESP32 + OLED Interactive Terminal"));
+                fa_sep();
+                Serial.println(F("\n  ============================"));
+                Serial.println(F("   COMMANDS"));
+                Serial.println(F("  ============================"));
+                Serial.println(F("   E:<message>     encrypt message"));
+                Serial.println(F("   D:<hex string>  decrypt ciphertext"));
+                Serial.println(F("   0               back to main menu"));
+                Serial.println(F("  ============================"));
+                Serial.println(F("   Examples:"));
+                Serial.println(F("   E:Hello World"));
+                Serial.println(F("   D:A73F8BD102E65C"));
+                Serial.println(F("  ============================\n"));
+                fa_sep();
+                fa_oledReady();
+            } else if (in.length() > 0) {
+                Serial.println(F("Invalid. Enter 1, 2, or 3."));
+                Serial.print(F(">> "));
+            }
+        }
+        return;
+    }
+
+    // ====================== MODE 1: PVRSC ======================
+    if (activeMode == 1) {
+        if (Serial.available()) {
+            String input = Serial.readStringUntil('\n');
+            input.trim();
+            if (input == "0") {
+                activeMode = 0; showMainMenu(); return;
+            }
+            process_serial_command(input);
+        }
+        if (pvrscMode == SYS_ENCRYPT) {
+            display_continuous_scroll(currentText);
+        }
+        return;
+    }
+
+    // ====================== MODE 2: MAGIC SQUARE ======================
+    if (activeMode == 2) {
+        if (!Serial.available()) return;
+        String input = Serial.readStringUntil('\n'); input.trim();
+        if (input.length() == 0) return;
+        if (input == "0") { activeMode = 0; showMainMenu(); return; }
+
+        // DECRYPT
+        if (input.length() > 2 && (input[0]=='D'||input[0]=='d') && input[1]==':') {
+            String rest = input.substring(2);
+            int sep2 = rest.lastIndexOf(':');
+            if (sep2 <= 0) { Serial.println(F("[ERR] D:<cipher>:<orig_len>")); showMSMenu(); return; }
+            String cStr = rest.substring(0, sep2);
+            int oLen = rest.substring(sep2+1).toInt();
+            if (oLen<=0 || cStr.length()==0) { Serial.println(F("[ERR] Bad input")); showMSMenu(); return; }
+            if ((int)cStr.length() > MAX_SZ) { Serial.println(F("[ERR] Too long")); showMSMenu(); return; }
+            Serial.println(F("\n---------- DECRYPTION ----------"));
+            int n=0;
+            unsigned long t0=micros();
+            const char* plain = doDecrypt(cStr.c_str(), oLen, &n);
+            unsigned long dt=micros()-t0;
+            if(n==0) { Serial.println(F("[ERR] Invalid length")); showMSMenu(); return; }
+            Serial.print(F(" Decrypted: \"")); serialPrintTrunc(plain,60); Serial.println('"');
+            Serial.print(F(" Time: ")); Serial.print(dt); Serial.println(F(" us"));
+            Serial.println(F("--------------------------------\n"));
+            oledScroll("Decrypted:", plain);
+            showMSMenu(); return;
+        }
+
+        // ENCRYPT
+        String msg = input;
+        if (msg.length()>2 && (msg[0]=='E'||msg[0]=='e') && msg[1]==':')
+            msg = msg.substring(2);
+        int mLen = (int)msg.length();
+        if (mLen==0) { Serial.println(F("[ERR] Empty")); showMSMenu(); return; }
+        if (mLen>MAX_SZ) { Serial.println(F("[ERR] Too long")); showMSMenu(); return; }
+
+        Serial.println(F("\n---------- ENCRYPTION ----------"));
+        Serial.print(F(" Input: \"")); serialPrintTrunc(msg.c_str(),60);
+        Serial.print(F("\" (")); Serial.print(mLen); Serial.println(')');
+        int n=0;
+        unsigned long t0=micros();
+        const char* cipher = doEncrypt(msg.c_str(), mLen, &n);
+        unsigned long dt=micros()-t0;
+        Serial.print(F(" Matrix: ")); Serial.print(n); Serial.print('x'); Serial.println(n);
+        if (n<=7) { serialSquare(n); serialMatrix(n); }
+        Serial.print(F(" Encrypted: \"")); serialPrintTrunc(cipher,60); Serial.println('"');
+        Serial.print(F(" Time: ")); Serial.print(dt); Serial.println(F(" us"));
+        Serial.print(F("\n To decrypt: D:"));
+        serialPrintTrunc(cipher,80); Serial.print(':'); Serial.println(mLen);
+
+        // Verify
+        int n2=0;
+        const char* plain = doDecrypt(cipher, mLen, &n2);
+        bool match = (strcmp(plain, msg.c_str()) == 0);
+        Serial.print(F(" Verify: ")); Serial.println(match ? F("[PASS]") : F("[FAIL]"));
+        Serial.println(F("--------------------------------\n"));
+
+        doEncrypt(msg.c_str(), mLen, &n);
+        oledMatrix(n);
+        oledScroll("Encrypted:", ebuf);
+        delay(1500);
+        doDecrypt(ebuf, mLen, &n2);
+        oledScroll("Verified:", dbuf_ms);
+        showMSMenu();
+        return;
+    }
+
+    // ====================== MODE 3: FRACTAL ATBASH ======================
+    if (activeMode == 3) {
+        fa_updateScroll();
+        if (!Serial.available()) return;
+        String input = Serial.readStringUntil('\n'); input.trim();
+        if (input == "0") {
+            activeMode = 0;
+            fa_scrollOn = false;
+            showMainMenu();
+            return;
+        }
+        if (input.length() < 2) return;
+
+        char c0 = input.charAt(0), c1 = input.charAt(1);
+        if ((c0=='E'||c0=='e') && c1==':') {
+            String msg = input.substring(2); msg.trim();
+            fa_handleEncrypt(msg);
+        } else if ((c0=='D'||c0=='d') && c1==':') {
+            String hex = input.substring(2); hex.trim();
+            fa_handleDecrypt(hex);
+        } else {
+            Serial.println();
+            Serial.println(F(" Unknown command."));
+            Serial.println(F(" Use E:<message> or D:<hex> or 0=exit"));
+            Serial.println();
+        }
+        return;
+    }
+}
